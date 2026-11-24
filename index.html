@@ -8,7 +8,9 @@
 *{box-sizing:border-box}
 body{margin:0;padding:12px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#f4f5f7;color:#222}
 h1{font-size:20px;margin:4px 0 12px}
-#video{width:100%;max-height:45vh;background:#000;border-radius:10px;object-fit:cover;display:block}
+#wrap{position:relative}
+#video{width:100%;max-height:50vh;background:#000;border-radius:10px;object-fit:cover;display:block}
+#guia{position:absolute;left:8%;right:8%;top:35%;height:30%;border:2px solid #34a853;border-radius:8px;pointer-events:none;box-shadow:0 0 0 9999px rgba(0,0,0,.25)}
 button{font-size:16px;padding:12px;border:0;border-radius:8px;background:#1a73e8;color:#fff;width:100%;margin-top:8px}
 button.sec{background:#5f6368}
 button:disabled{opacity:.6}
@@ -21,9 +23,12 @@ input,select,textarea{width:100%;font-size:16px;padding:10px;border:1px solid #b
 </head>
 <body>
 <h1>Escáner de códigos</h1>
+<div id="wrap">
 <video id="video" autoplay playsinline muted></video>
+<div id="guia"></div>
+</div>
 <button id="startBtn" class="sec" type="button">Activar cámara</button>
-<div id="status">Pulsa "Activar cámara" y apunta al código (EAN-13 o Code 128), o escribe el código a mano abajo.</div>
+<div id="status">Pulsa "Activar cámara", centra el código dentro del recuadro verde y acércalo a unos 10–15 cm. Si no lo lee, escríbelo a mano abajo.</div>
 
 <form id="form">
 <label for="codigo">Código</label>
@@ -54,8 +59,10 @@ const $ = id => document.getElementById(id);
 const statusEl = $('status');
 const video = $('video');
 const canvas = document.createElement('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
 let stream = null;
 let timer = null;
+let busy = false;
 let lastCode = '';
 let lastTime = 0;
 
@@ -65,13 +72,20 @@ function updateLabel() { $('cantLabel').textContent = $('tipo').value === 'Medid
 $('tipo').addEventListener('change', updateLabel);
 updateLabel();
 
-let decoder = null;
+// Lector nativo del navegador (Chrome en Android). En iPhone no existe: se usa ZXing.
+let nativeDetector = null;
+if ('BarcodeDetector' in window) {
+  try { nativeDetector = new BarcodeDetector({ formats: ['ean_13', 'code_128'] }); } catch (e) { nativeDetector = null; }
+}
+
+// Lector ZXing (funciona en Android e iPhone)
+let zxing = null;
 if (window.ZXing) {
   const hints = new Map();
   hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.CODE_128]);
   hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-  decoder = new ZXing.MultiFormatReader();
-  decoder.setHints(hints);
+  zxing = new ZXing.MultiFormatReader();
+  zxing.setHints(hints);
 }
 
 function onCode(text, fmt) {
@@ -80,25 +94,46 @@ function onCode(text, fmt) {
   lastCode = text;
   lastTime = now;
   $('codigo').value = text;
-  $('formato').value = fmt === 'EAN_13' ? 'EAN-13' : (fmt === 'CODE_128' ? 'Code 128' : fmt);
+  $('formato').value = fmt === 'ean_13' || fmt === 'EAN_13' ? 'EAN-13' : (fmt === 'code_128' || fmt === 'CODE_128' ? 'Code 128' : fmt);
   if (navigator.vibrate) navigator.vibrate(120);
   setStatus('Código leído. Revisa los datos y pulsa Guardar.', 'ok');
 }
 
-function decodeFrame() {
-  if (!decoder || !video.videoWidth) return;
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-  let result = null;
+function decodeZXing() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  // Franja central horizontal, donde normalmente está el código
+  const cw = Math.round(vw * 0.84), ch = Math.round(vh * 0.36);
+  const sx = Math.round((vw - cw) / 2), sy = Math.round((vh - ch) / 2);
+  canvas.width = cw;
+  canvas.height = ch;
+  ctx.drawImage(video, sx, sy, cw, ch, 0, 0, cw, ch);
   try {
     const source = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
     const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(source));
-    result = decoder.decode(bitmap);
+    const result = zxing.decode(bitmap);
+    onCode(result.getText(), ZXing.BarcodeFormat[result.getBarcodeFormat()]);
   } catch (e) {
-    result = null;
+    // no hay código en esta imagen
   }
-  if (result) onCode(result.getText(), ZXing.BarcodeFormat[result.getBarcodeFormat()]);
+}
+
+async function scanFrame() {
+  if (busy || !stream || !video.videoWidth) return;
+  busy = true;
+  try {
+    if (nativeDetector) {
+      const codes = await nativeDetector.detect(video);
+      if (codes.length) {
+        onCode(codes[0].rawValue, codes[0].format);
+        return;
+      }
+    }
+    if (zxing) decodeZXing();
+  } catch (e) {
+    // error puntual de lectura: se reintenta en el siguiente cuadro
+  } finally {
+    busy = false;
+  }
 }
 
 function stopCamera() {
@@ -112,19 +147,30 @@ function stopCamera() {
 
 $('startBtn').addEventListener('click', async () => {
   if (stream) { stopCamera(); return; }
-  if (!decoder) { setStatus('No se cargó el lector de códigos. Escribe el código a mano.', 'err'); return; }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     setStatus('Este navegador no permite la cámara. Escribe el código a mano.', 'err');
     return;
   }
   try {
     setStatus('Abriendo cámara...');
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
+    });
     video.srcObject = stream;
     await video.play();
+    // Enfoque continuo, si el teléfono lo permite
+    try {
+      const track = stream.getVideoTracks()[0];
+      await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+    } catch (e) { /* el dispositivo no soporta este ajuste */ }
     $('startBtn').textContent = 'Detener cámara';
-    timer = setInterval(decodeFrame, 300);
-    setStatus('Apunta al código de barras. Si no lo lee, escríbelo a mano.');
+    timer = setInterval(scanFrame, 250);
+    setStatus('Centra el código en el recuadro verde. Si no lo lee, escríbelo a mano.');
   } catch (err) {
     stream = null;
     setStatus('No se pudo abrir la cámara (' + err.name + '). Escribe el código a mano.', 'err');
