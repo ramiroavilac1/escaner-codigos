@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Escáner de códigos</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:12px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#f4f5f7;color:#222}
+h1{font-size:20px;margin:4px 0 12px}
+#video{width:100%;max-height:45vh;background:#000;border-radius:10px;object-fit:cover}
+button{font-size:16px;padding:12px;border:0;border-radius:8px;background:#1a73e8;color:#fff;width:100%;margin-top:8px}
+button.sec{background:#5f6368}
+button:disabled{opacity:.6}
+label{display:block;font-weight:600;margin-top:12px;font-size:14px}
+input,select,textarea{width:100%;font-size:16px;padding:10px;border:1px solid #bbb;border-radius:8px;margin-top:4px;background:#fff}
+#status{margin-top:10px;padding:10px;border-radius:8px;background:#e8f0fe;font-size:14px;min-height:20px}
+.ok{background:#e6f4ea!important}
+.err{background:#fce8e6!important}
+</style>
+</head>
+<body>
+<h1>Escáner de códigos</h1>
+<video id="video" playsinline muted></video>
+<button id="startBtn" class="sec" type="button">Activar cámara</button>
+<div id="status">Pulsa "Activar cámara" y apunta al código de barras (EAN-13 o Code 128).</div>
+
+<form id="form">
+<label for="codigo">Código escaneado</label>
+<input id="codigo" readonly placeholder="Esperando lectura...">
+<label for="formato">Formato</label>
+<input id="formato" readonly placeholder="—">
+<label for="tipo">Tipo</label>
+<select id="tipo">
+<option value="Bodega">Bodega</option>
+<option value="Medidor">Medidor</option>
+</select>
+<label id="cantLabel" for="cantidad">Cantidad</label>
+<input id="cantidad" type="number" inputmode="decimal" step="any" min="0">
+<label for="usuario">Usuario</label>
+<input id="usuario" type="text">
+<label for="notas">Notas</label>
+<textarea id="notas" rows="3"></textarea>
+<button type="submit" id="saveBtn">Guardar</button>
+</form>
+
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script>
+const ENDPOINT = 'https://script.google.com/macros/s/AKfycbz1J5pGF_FvmDZU8kdkcAOXjmptCx9NMJvY4-7RCxw1wbr6Q6e3kqtXHiXFHyvsK3RlBg/exec';
+const TOKEN = 'AKfycbz1J5pGF_FvmDZU8kdkcAOXjmptCx9NMJvY4-7RCxw1wbr6Q6e3kqtXHiXFHyvsK3RlBg';
+const HOJA = 'Escaneos';
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ''; }
+
+const hints = new Map();
+hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.CODE_128]);
+const reader = new ZXing.BrowserMultiFormatReader(hints);
+let controls = null;
+let lastCode = '';
+let lastTime = 0;
+
+function updateLabel() { $('cantLabel').textContent = $('tipo').value === 'Medidor' ? 'Lectura' : 'Cantidad'; }
+$('tipo').addEventListener('change', updateLabel);
+updateLabel();
+
+$('startBtn').addEventListener('click', async () => {
+  if (controls) {
+    controls.stop();
+    controls = null;
+    $('startBtn').textContent = 'Activar cámara';
+    setStatus('Cámara detenida.');
+    return;
+  }
+  try {
+    setStatus('Iniciando cámara...');
+    controls = await reader.decodeFromConstraints(
+      { video: { facingMode: { ideal: 'environment' } } },
+      $('video'),
+      (result) => {
+        if (!result) return;
+        const now = Date.now();
+        if (result.getText() === lastCode && now - lastTime < 2000) return;
+        lastCode = result.getText();
+        lastTime = now;
+        $('codigo').value = result.getText();
+        $('formato').value = ZXing.BarcodeFormat[result.getBarcodeFormat()];
+        if (navigator.vibrate) navigator.vibrate(120);
+        setStatus('Código leído. Completa los datos y pulsa Guardar.', 'ok');
+      }
+    );
+    $('startBtn').textContent = 'Detener cámara';
+    setStatus('Apunta al código de barras.');
+  } catch (err) {
+    setStatus('No se pudo abrir la cámara: ' + err.message, 'err');
+  }
+});
+
+$('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const codigo = $('codigo').value.trim();
+  const cantidad = $('cantidad').value.trim();
+  if (!codigo) { setStatus('Primero escanea un código.', 'err'); return; }
+  if (cantidad === '') { setStatus('Escribe la cantidad o la lectura.', 'err'); return; }
+
+  const payload = {
+    token: TOKEN,
+    hoja: HOJA,
+    fecha: new Date().toISOString(),
+    tipo: $('tipo').value,
+    codigo: codigo,
+    formato: $('formato').value,
+    cantidad: cantidad,
+    usuario: $('usuario').value.trim(),
+    notas: $('notas').value.trim()
+  };
+
+  $('saveBtn').disabled = true;
+  setStatus('Guardando...');
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (data.ok) {
+      setStatus('Guardado en la hoja.', 'ok');
+      $('codigo').value = '';
+      $('formato').value = '';
+      $('cantidad').value = '';
+      $('notas').value = '';
+      lastCode = '';
+    } else {
+      setStatus('Error: ' + data.error, 'err');
+    }
+  } catch (err) {
+    setStatus('No se pudo enviar: ' + err.message, 'err');
+  } finally {
+    $('saveBtn').disabled = false;
+  }
+});
+</script>
+</body>
+</html>
